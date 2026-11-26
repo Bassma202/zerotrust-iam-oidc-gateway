@@ -1,0 +1,98 @@
+{
+  "realm": "limen-heritage",
+  "displayName": "LIMEN Heritage & Research Zero-Trust Realm",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "bruteForceProtected": true,
+  "failureFactor": 5,
+  "accessTokenLifespan": 300,
+  "roles": {
+    "realm": [
+      { "name": "ROLE_ARCHIVIST", "description": "Archival specialist with read/annotate rights" },
+      { "name": "ROLE_RESEARCHER", "description": "Scientific researcher with own-record access" },
+      { "name": "ROLE_CONTRACTOR_RESTORER", "description": "Time-limited external restoration contractor" },
+      { "name": "ROLE_SECURITY_AUDITOR", "description": "Independent read-only audit and SoD reviewer" },
+      { "name": "ROLE_ADMIN", "description": "IAM platform administrator" }
+    ]
+  },
+  "clientScopes": [
+    {
+      "name": "limen:api",
+      "description": "LIMEN protected API access scope",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      }
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "limen-web-pkce",
+      "name": "LIMEN Governance SPA (Authorization Code + PKCE S256)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": ["http://127.0.0.1:8004/callback"],
+      "attributes": { "pkce.code.challenge.method": "S256" }
+    },
+    {
+      "clientId": "limen-service-client",
+      "name": "LIMEN Confidential Machine Service Client",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "secret": "lab-client-secret-rotate-in-prod",
+      "defaultClientScopes": ["limen:api"],
+      "protocolMappers": [
+        {
+          "name": "limen-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "limen-api",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        },
+        {
+          "name": "limen-api-scope",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "scope",
+            "claim.value": "openid limen:api",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        },
+        {
+          "name": "realm-roles-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-limen-service-client",
+      "enabled": true,
+      "serviceAccountClientId": "limen-service-client",
+      "realmRoles": ["ROLE_SECURITY_AUDITOR"]
+    }
+  ]
+}

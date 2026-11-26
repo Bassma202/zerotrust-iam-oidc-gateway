@@ -1,105 +1,35 @@
-# Zero-Trust IAM & OIDC API Gateway
+# LIMEN — Zero-Trust Identity Security & Access Governance
 
-[![CI](https://github.com/Bassma202/zerotrust-iam-oidc-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/Bassma202/zerotrust-iam-oidc-gateway/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.11](https://img.shields.io/badge/Python-3.11-green.svg)](https://www.python.org/)
-[![OIDC](https://img.shields.io/badge/Standard-OAuth2%20%2F%20OIDC-blueviolet.svg)](https://openid.net/)
-[![Keycloak](https://img.shields.io/badge/IdP-Keycloak%2022-red.svg)](https://www.keycloak.org/)
+**Repository:** `https://github.com/Bassma202/zerotrust-iam-oidc-gateway`  
+**Author:** Bassma Alaoui Sossey — Final-Year Cybersecurity Engineering Student (Université Euromed de Fès — EIDIA)
 
-> **Zero-Trust Identity and Access Management (IAM) API Gateway. Enforces cryptographic JWT verification (OAuth 2.0 / OpenID Connect), Role-Based Access Control (RBAC), and automated Segregation of Duties (SoD) conflict detection.**
+## 1. Purpose
+LIMEN is a Zero-Trust Identity & Access Management (IAM) and Identity Governance (IGA) engineering platform built around live Keycloak 26 OIDC/JWKS federation, asymmetric RS256 policy enforcement, Joiner/Mover/Leaver lifecycle controls, time-limited contractor grants, preventive Segregation of Duties (SoD), and explainable Jaccard role mining.
 
----
+## 2. Implemented Capabilities
+- **Live Keycloak 26.0.7 + PostgreSQL 16.6 Stack (`docker-compose.yml`, `config/limen-realm.json`)**: Reproducible `limen-heritage` realm with PKCE S256 public SPA client (`limen-web-pkce`), confidential service client (`limen-service-client`), custom `limen-api` audience protocol mapper, and `300s` short-lived access tokens. Zero hardcoded database/admin passwords in Compose.
+- **Asymmetric RS256/JWKS Token Verification (`src/limen/oidc.py`)**: Eliminates hardcoded symmetric secrets; validates `RS256` signatures via trusted JWKS with `kid` key-rotation refresh, `iss`, `aud`, `exp`, `nbf`, required `scope`, token-type separation (rejecting ID tokens on APIs), and JTI/subject revocation.
+- **Real Protected Resource APIs (`src/limen/web.py`)**: Enforces default-deny RBAC, multi-tenant collection scoping, resource-level ownership checks (horizontal IDOR prevention), and auditor/admin route separation (vertical escalation prevention).
+- **Joiner / Mover / Leaver & Temporary Contractor Grants (`src/limen/governance.py`)**: Joiner provisioning with preventive SoD, Mover stale-entitlement stripping, Leaver immediate access revocation, and TTL-enforced temporary contractor grants.
+- **Direct + Inherited SoD Engine (`src/limen/governance.py`)**: Expands role-to-entitlement inheritance to block toxic combinations (`SOD-001` request/approve, `SOD-002` admin/audit, `SOD-003` contractor/vault-write).
+- **Explainable Jaccard Role Mining (`src/limen/role_mining.py`)**: Computes user-entitlement Jaccard clusters using core intersection (zero over-assignment), reporting baseline vs. post-mining coverage, redundancy reduction, and an overprivilege review queue requiring human approval.
+- **Governance Web UI (`src/limen/web.py`)**: Live directory, SoD status, and role-mining recommendations backed by SQLite (`data/limen.db`).
 
-## 1. Executive Summary & Architecture
-
-Modern enterprise security relies on identity as the primary security perimeter. In a Zero-Trust architecture, network locality grants zero implicit trust; every API request must present cryptographically verifiable identity claims.
-
-This project implements:
-1. **OIDC/OAuth 2.0 Token Validation Engine:** Verifies cryptographic signatures (HMAC-SHA256 / RS256), token expiration (`exp`), issuer integrity (`iss`), and audience (`aud`).
-2. **Policy Enforcement Point (PEP):** Intercepts API calls, maps requested routes to required roles, and enforces Least Privilege access control.
-3. **Segregation of Duties (SoD) Auditor:** Scans enterprise entitlement matrices to detect hazardous toxic role combinations (e.g., Payment Creator + Payment Approver).
-4. **Keycloak Identity Provider Stack:** Production Docker Compose deployment for Keycloak with persistent PostgreSQL.
-
-```mermaid
-flowchart LR
-    subgraph Client_Layer ["Client Applications"]
-        CLI[Client / Frontend Application]
-    end
-
-    subgraph Identity_Provider ["Keycloak IdP (OAuth2 / OIDC)"]
-        AUTH[Token Issuer<br/>JWT: sub, roles, exp, iss]
-    end
-
-    subgraph Security_Gateway ["Zero-Trust API Gateway (PEP)"]
-        VAL[JWT Cryptographic Validator]
-        RBAC[RBAC Role Checker]
-        SOD[SoD Conflict Auditor]
-    end
-
-    subgraph Protected_Services ["Backend Microservices"]
-        SRV1[Patient Records API]
-        SRV2[Audit Logs API]
-        SRV3[Admin Users API]
-    end
-
-    CLI -->|1. Authenticate with credentials| AUTH
-    AUTH -->|2. Return Signed JWT Bearer Token| CLI
-    CLI -->|3. Request with Bearer Token| VAL
-    VAL -->|4. Valid Signature & Non-expired| RBAC
-    RBAC -->|5. Authorized Role Match| Protected_Services
-    SOD -.->|Audits User Roles for Toxic Combos| AUTH
-```
-
----
-
-## 2. Segregation of Duties (SoD) Conflict Catalog
-
-| Conflict ID | Rule Name | Conflicting Entitlements | Risk Exposure |
-| :--- | :--- | :--- | :--- |
-| **SOD-01** | Payment Creator & Approver | `FIN_PAYMENT_CREATOR` + `FIN_PAYMENT_APPROVER` | Internal financial fraud; unilateral funds disbursement. |
-| **SOD-02** | User Admin & Log Deleter | `IAM_USER_ADMIN` + `SEC_LOG_ADMIN` | Rogue account creation with audit trail wiping. |
-| **SOD-03** | Developer & Production Deployer | `DEV_ENGINEER` + `PROD_DEPLOYER` | Direct unreviewed code deployment into production (ISO 27001 A.8.9 violation). |
-| **SOD-04** | Health Record Creator & De-anonymizer | `DATA_CREATOR` + `PRIVACY_DEANONYMIZER` | Unauthorized re-identification of medical patient data (Moroccan Law 09-08 violation). |
-
----
-
-## 3. Quickstart & Testing
-
-### Running Keycloak Identity Provider (Docker)
+## 3. Quick Start & Reproduction
 ```bash
-# Clone the repository
-git clone https://github.com/Bassma202/zerotrust-iam-oidc-gateway.git
-cd zerotrust-iam-oidc-gateway
-
-# Start Keycloak + PostgreSQL
-docker-compose up -d
-
-# Keycloak Console will be available at: http://localhost:8080 (admin / admin_password)
+cp .env.example .env   # Set local lab passwords
+make setup
+make test
+make security
+make up-idp            # Boots Keycloak 26 + PostgreSQL 16 on 127.0.0.1:8080
+make verify-idp        # Executes live RS256 token acquisition & PEP verification
+make down-idp          # Clean teardown
+make up                # Launches LIMEN governance UI on http://127.0.0.1:8004
 ```
 
-### Running Automated Test Suite
-```bash
-python3 -m unittest discover tests
-```
+## 4. Known Limitations
+- Local laboratory Compose uses Keycloak `start-dev` over loopback (`127.0.0.1:8080`); TLS termination and production build optimizations are documented separately in `docs/THREAT_MODEL.md`.
+- Real-time revocation of stateless access tokens requires either short token lifetimes (`300s`), token introspection, or the PEP denylist implemented here.
 
----
-
-## 4. Verification & Policy Enforcement Results
-
-```text
-Test Scenarios:
-[200 OK]        Doctor accessing /api/v1/patient/records -> ALLOWED
-[403 FORBIDDEN] Standard User accessing /api/v1/audit/logs -> FORBIDDEN (Role mismatch)
-[401 UNAUTH]    Expired JWT token -> REJECTED (TOKEN_EXPIRED)
-[401 UNAUTH]    Tampered token signature -> REJECTED (INVALID_SIGNATURE)
-[CRITICAL]      User holds FIN_PAYMENT_CREATOR + APPROVER -> FLAGGED (SOD-01 Conflict)
-```
-
----
-
-## 5. Author & Academic Context
-
-* **Author:** **Bassma Alaoui Sossey**  
-* **Degree:** Diplôme d'Ingénieur d'État en Cybersécurité  
-* **Institution:** Université Euromed de Fès (UEMF), Morocco  
-* **Specialization:** Identity & Access Management (IAM), Cloud Security, Enterprise Zero-Trust Architecture
+## 5. License
+MIT License.

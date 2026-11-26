@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "limen-iam"
+version = "2.0.0"
+description = "LIMEN — Zero-Trust Identity Security, RS256 OIDC Policy Enforcement & Access Governance"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Bassma Alaoui Sossey" }]
+dependencies = [
+    "fastapi>=0.115.6,<0.117.0",
+    "uvicorn[standard]>=0.32.1,<0.35.0",
+    "pydantic>=2.10.3,<3.0.0",
+    "pyjwt[crypto]>=2.10.1,<3.0.0",
+    "cryptography>=44.0.0,<45.0.0",
+    "httpx>=0.28.1,<0.29.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.4,<9.0.0",
+    "pytest-cov>=6.0.0,<7.0.0",
+    "ruff>=0.8.4,<0.10.0",
+    "bandit>=1.8.0,<2.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/limen"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]

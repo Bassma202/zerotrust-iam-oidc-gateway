@@ -1,39 +1,48 @@
-version: '3.8'
-
+# LIMEN Local Laboratory Identity Provider Stack (Keycloak 26.0.7 + PostgreSQL 16.6)
+# NOTE: Configured for local loopback development. See docs/THREAT_MODEL.md for hardened TLS/production settings.
 services:
   postgres:
-    image: postgres:15-alpine
-    container_name: keycloak_postgres
+    image: postgres:16.6-alpine
+    container_name: limen_postgres
     environment:
       POSTGRES_DB: keycloak
-      POSTGRES_USER: keycloak
-      POSTGRES_PASSWORD: keycloak_password
+      POSTGRES_USER: ${KC_DB_USERNAME:?Set KC_DB_USERNAME in .env}
+      POSTGRES_PASSWORD: ${KC_DB_PASSWORD:?Set KC_DB_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${KC_DB_USERNAME} -d keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - limen_pg_data:/var/lib/postgresql/data
     networks:
-      - iam_network
+      - limen_internal
 
   keycloak:
-    image: quay.io/keycloak/keycloak:22.0
-    container_name: keycloak_idp
-    command: start-dev
+    image: quay.io/keycloak/keycloak:26.0.7
+    container_name: limen_keycloak
+    command: ["start-dev"]
     environment:
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
-      KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: keycloak_password
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin_password
+      KC_DB_USERNAME: ${KC_DB_USERNAME:?Set KC_DB_USERNAME in .env}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD:?Set KC_DB_PASSWORD in .env}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:-limen-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:?Set KC_BOOTSTRAP_ADMIN_PASSWORD in .env}
+      KC_HEALTH_ENABLED: "true"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config/limen-realm.json:/opt/keycloak/data/import/limen-realm.json:ro
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     networks:
-      - iam_network
+      - limen_internal
 
 networks:
-  iam_network:
+  limen_internal:
     driver: bridge
 
 volumes:
-  postgres_data:
+  limen_pg_data:
