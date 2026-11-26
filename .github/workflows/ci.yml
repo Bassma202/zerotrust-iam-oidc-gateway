@@ -36,3 +36,11 @@ jobs:
 
       - name: Run full pytest suite
         run: pytest -v
+
+  forge-reusable-security-gate:
+    name: Cross-Project FORGE Reusable Security Gate
+    uses: Bassma202/ai-devsecops-telegram-agent/.github/workflows/reusable-security-gate.yml@main
+    with:
+      python-version: "3.12"
+      source-path: "src"
+      run-pytest: false
