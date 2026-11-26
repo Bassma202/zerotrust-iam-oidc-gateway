@@ -1,12 +1,14 @@
-"""Asymmetric RS256/JWKS OIDC Token Validator for LIMEN Policy Enforcement Point.
+"""Asymmetric RS256/JWKS OIDC Token Validator for LIMEN Policy Enforcement Point (Remediated LIMEN-01, LIMEN-02).
 
 Strictly enforces:
 - Allowed algorithms = ["RS256"] only (rejects HS256, alg=none, arbitrary algorithms).
 - Trusted issuer (`iss`) and intended audience (`aud`).
 - Expiration (`exp`) and not-before (`nbf`) with minimal clock skew.
 - Token use separation: rejects ID tokens (`typ=ID` or missing API scope) presented as access tokens.
+- LIMEN-01: Explicit resource-client role contract — ONLY reads resource_access[trusted_resource_client]
+  and explicitly allowlisted realm roles; ignores roles belonging to unrelated OAuth clients.
+- LIMEN-02: Fail-closed tenant enforcement — rejects missing, empty, ambiguous, or unknown tenant claims.
 - Trusted JWKS key lookup by `kid` with automatic cache refresh on key rotation.
-- Local JTI/subject revocation denylist supporting immediate Leaver termination.
 """
 
 from __future__ import annotations
@@ -19,6 +21,20 @@ from typing import Any
 import httpx
 import jwt
 from jwt.algorithms import RSAAlgorithm
+
+KNOWN_LIMEN_ROLES = frozenset(
+    {
+        "ROLE_ARCHIVIST",
+        "ROLE_RESEARCHER",
+        "ROLE_CONTRACTOR_RESTORER",
+        "ROLE_ACCESS_REQUESTER",
+        "ROLE_ACCESS_APPROVER",
+        "ROLE_SECURITY_AUDITOR",
+        "ROLE_ADMIN",
+    }
+)
+
+DEFAULT_TRUSTED_TENANTS = frozenset({"heritage-core", "partner-museum"})
 
 
 class TokenValidationError(Exception):
@@ -83,7 +99,6 @@ class JWKSKeyStore:
             self.refresh()
         if kid in self._keys:
             return self._keys[kid]
-        # Key rotation support: force single refresh on unknown kid
         self.refresh()
         if kid in self._keys:
             return self._keys[kid]
@@ -98,11 +113,17 @@ class OIDCValidator:
         expected_issuer: str,
         expected_audience: str,
         key_store: JWKSKeyStore,
+        trusted_resource_client: str | None = None,
+        trusted_tenants: set[str] | frozenset[str] | None = None,
+        accept_realm_roles: bool = True,
         revoked_jtis: set[str] | None = None,
         disabled_subjects: set[str] | None = None,
     ) -> None:
         self.expected_issuer = expected_issuer
         self.expected_audience = expected_audience
+        self.trusted_resource_client = trusted_resource_client or expected_audience
+        self.trusted_tenants = frozenset(trusted_tenants) if trusted_tenants is not None else DEFAULT_TRUSTED_TENANTS
+        self.accept_realm_roles = accept_realm_roles
         self.key_store = key_store
         self.revoked_jtis = revoked_jtis if revoked_jtis is not None else set()
         self.disabled_subjects = disabled_subjects if disabled_subjects is not None else set()
@@ -150,7 +171,6 @@ class OIDCValidator:
         except jwt.PyJWTError as exc:
             raise TokenValidationError("SIGNATURE_OR_CLAIMS_INVALID", str(exc)) from exc
 
-        # Reject ID tokens presented as API access tokens
         tok_typ = str(claims.get("typ", "")).lower()
         if tok_typ == "id" or ("nonce" in claims and "scope" not in claims):
             raise TokenValidationError("WRONG_TOKEN_TYPE", "ID tokens cannot be used as API access tokens.")
@@ -159,16 +179,36 @@ class OIDCValidator:
         if jti and jti in self.revoked_jtis:
             raise TokenValidationError("TOKEN_REVOKED", "Token JTI has been revoked.")
 
-        sub = str(claims["sub"])
+        sub = str(claims["sub"]).strip()
+        if not sub:
+            raise TokenValidationError("MISSING_SUBJECT", "Token subject claim is empty.")
         if sub in self.disabled_subjects:
             raise TokenValidationError("IDENTITY_DISABLED", "Identity has been disabled via Leaver workflow.")
 
-        # Extract Keycloak realm_access + resource_access + flat roles
-        roles: set[str] = set(claims.get("roles", []) or [])
-        roles.update(claims.get("realm_access", {}).get("roles", []) or [])
-        for client_obj in (claims.get("resource_access") or {}).values():
-            if isinstance(client_obj, dict):
-                roles.update(client_obj.get("roles", []) or [])
+        # LIMEN-02: Strict fail-closed tenant verification (never silently default!)
+        raw_tenant = claims.get("tenant")
+        if not isinstance(raw_tenant, str) or not raw_tenant.strip():
+            raise TokenValidationError("MISSING_OR_AMBIGUOUS_TENANT", "Verified single string 'tenant' claim is required.")
+        tenant = raw_tenant.strip()
+        if tenant not in self.trusted_tenants:
+            raise TokenValidationError("UNKNOWN_TENANT", f"Tenant '{tenant}' is not registered in trusted tenant directory.")
+
+        # LIMEN-01: Strict trusted role extraction (ONLY trusted resource client + allowlisted realm roles)
+        roles: set[str] = set()
+        res_access = claims.get("resource_access")
+        if isinstance(res_access, dict):
+            trusted_client_obj = res_access.get(self.trusted_resource_client)
+            if isinstance(trusted_client_obj, dict):
+                for r in trusted_client_obj.get("roles") or []:
+                    if isinstance(r, str) and r in KNOWN_LIMEN_ROLES:
+                        roles.add(r)
+
+        if self.accept_realm_roles:
+            realm_access = claims.get("realm_access")
+            if isinstance(realm_access, dict):
+                for r in realm_access.get("roles") or []:
+                    if isinstance(r, str) and r in KNOWN_LIMEN_ROLES:
+                        roles.add(r)
 
         raw_scope = str(claims.get("scope", ""))
         scopes = {s for s in raw_scope.split() if s}
@@ -180,7 +220,7 @@ class OIDCValidator:
             username=str(claims.get("preferred_username", sub)),
             roles=roles,
             scopes=scopes,
-            tenant=str(claims.get("tenant", "heritage-core")),
+            tenant=tenant,
             jti=jti,
             expires_at=int(claims["exp"]),
             raw_claims=claims,

@@ -1,9 +1,10 @@
-"""Identity Lifecycle (Joiner/Mover/Leaver), Time-Limited Grants, and Direct+Inherited SoD Engine."""
+"""Identity Lifecycle (Joiner/Mover/Leaver), Time-Limited Grants, and Atomic Cumulative SoD Engine (LIMEN-04, LIMEN-05)."""
 
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -55,7 +56,8 @@ SOD_POLICIES: list[dict[str, Any]] = [
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS identities (
     user_id TEXT PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
+    username TEXT NOT NULL,
+    tenant TEXT NOT NULL DEFAULT 'heritage-core',
     department TEXT NOT NULL,
     identity_type TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -87,23 +89,25 @@ CREATE TABLE IF NOT EXISTS iam_audit (
 
 
 class GovernanceEngine:
+    """SQLite-backed Identity Governance Engine enforcing atomic cumulative SoD and cross-worker revocation."""
+
     def __init__(self, db_path: str | Path = "data/limen.db") -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._tx_lock = threading.Lock()
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=15.0)
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _log(self, actor: str, action: str, target_user: str, outcome: str, detail: str) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO iam_audit (event_id, timestamp, actor, action, target_user, outcome, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (f"IAM-{uuid.uuid4().hex[:10].upper()}", utc_iso(), actor, action, target_user, outcome, detail),
-            )
+    def _log_conn(self, conn: sqlite3.Connection, actor: str, action: str, target_user: str, outcome: str, detail: str) -> None:
+        conn.execute(
+            "INSERT INTO iam_audit (event_id, timestamp, actor, action, target_user, outcome, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (f"IAM-{uuid.uuid4().hex[:10].upper()}", utc_iso(), actor, action, target_user, outcome, detail),
+        )
 
     def effective_entitlements(self, roles: list[str], direct: list[str], active_temp: list[str] | None = None) -> set[str]:
         eff = set(direct)
@@ -130,6 +134,11 @@ class GovernanceEngine:
                 )
         return conflicts
 
+    def _active_temp_in_conn(self, conn: sqlite3.Connection, user_id: str, ref: datetime | None = None) -> list[str]:
+        now_ref = ref or utc_now()
+        rows = conn.execute("SELECT entitlement, expires_at FROM temp_grants WHERE user_id=? AND revoked=0", (user_id,)).fetchall()
+        return [r["entitlement"] for r in rows if datetime.fromisoformat(r["expires_at"]) > now_ref]
+
     def joiner(
         self,
         user_id: str,
@@ -140,53 +149,95 @@ class GovernanceEngine:
         direct_entitlements: list[str] | None = None,
         owner: str = "IAM Governance",
         actor: str = "hr-lifecycle",
+        tenant: str = "heritage-core",
         enforce_preventive_sod: bool = True,
     ) -> dict[str, Any]:
         direct = direct_entitlements or []
-        conflicts = self.detect_sod_conflicts(roles, direct)
-        if enforce_preventive_sod and conflicts:
-            self._log(actor, "JOINER_BLOCKED", user_id, "DENIED_SOD", f"{len(conflicts)} SoD conflicts detected.")
-            raise ValueError(f"Preventive SoD block: {[c['policy_id'] for c in conflicts]}")
-        with self._connect() as conn:
+        with self._tx_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            active_temp = self._active_temp_in_conn(conn, user_id)
+            conflicts = self.detect_sod_conflicts(roles, direct, active_temp)
+            if enforce_preventive_sod and conflicts:
+                self._log_conn(conn, actor, "JOINER_BLOCKED", user_id, "DENIED_SOD", f"{len(conflicts)} SoD conflicts detected.")
+                conn.commit()
+                raise ValueError(f"Preventive SoD block: {[c['policy_id'] for c in conflicts]}")
             conn.execute(
                 """INSERT OR REPLACE INTO identities
-                (user_id, username, department, identity_type, status, roles_json, direct_entitlements_json, owner, updated_at)
-                VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?)""",
-                (user_id, username, department, identity_type, json.dumps(sorted(set(roles))), json.dumps(sorted(set(direct))), owner, utc_iso()),
+                (user_id, username, tenant, department, identity_type, status, roles_json, direct_entitlements_json, owner, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?)""",
+                (user_id, username, tenant, department, identity_type, json.dumps(sorted(set(roles))), json.dumps(sorted(set(direct))), owner, utc_iso()),
             )
-        self._log(actor, "JOINER", user_id, "ALLOWED", f"Provisioned {identity_type} in {department} with roles {roles}.")
-        return self.get_identity(user_id)
+            self._log_conn(conn, actor, "JOINER", user_id, "ALLOWED", f"Provisioned {identity_type} in {department} ({tenant}) with roles {roles}.")
+            conn.commit()
+        res = self.get_identity(user_id)
+        assert res is not None
+        return res
 
     def mover(self, user_id: str, new_department: str, new_roles: list[str], actor: str = "hr-lifecycle") -> dict[str, Any]:
-        ident = self.get_identity(user_id)
-        if not ident:
-            raise KeyError(f"Identity {user_id} not found.")
-        conflicts = self.detect_sod_conflicts(new_roles, [])
-        if conflicts:
-            self._log(actor, "MOVER_BLOCKED", user_id, "DENIED_SOD", f"SoD conflict on role change: {[c['policy_id'] for c in conflicts]}")
-            raise ValueError(f"Preventive SoD block on mover: {[c['policy_id'] for c in conflicts]}")
-        # Mover strips stale historical direct entitlements and old roles
-        with self._connect() as conn:
+        """Atomically transition department/roles, revoking stale direct and temporary entitlements, enforcing SoD."""
+        with self._tx_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM identities WHERE user_id=?", (user_id,)).fetchone()
+            if not row:
+                conn.rollback()
+                raise KeyError(f"Identity {user_id} not found.")
+            if row["status"] != "ACTIVE":
+                conn.rollback()
+                raise ValueError("Cannot move a disabled identity.")
+            conflicts = self.detect_sod_conflicts(new_roles, [], [])
+            if conflicts:
+                self._log_conn(conn, actor, "MOVER_BLOCKED", user_id, "DENIED_SOD", f"SoD conflict on role change: {[c['policy_id'] for c in conflicts]}")
+                conn.commit()
+                raise ValueError(f"Preventive SoD block on mover: {[c['policy_id'] for c in conflicts]}")
+            old_roles = json.loads(row["roles_json"])
             conn.execute(
                 "UPDATE identities SET department=?, roles_json=?, direct_entitlements_json='[]', updated_at=? WHERE user_id=?",
                 (new_department, json.dumps(sorted(set(new_roles))), utc_iso(), user_id),
             )
-        self._log(actor, "MOVER", user_id, "ALLOWED", f"Moved to {new_department}; stripped historical roles {ident['roles']} -> {new_roles}.")
-        return self.get_identity(user_id)
+            # Revoke stale temporary grants from previous department role
+            conn.execute("UPDATE temp_grants SET revoked=1 WHERE user_id=? AND revoked=0", (user_id,))
+            self._log_conn(conn, actor, "MOVER", user_id, "ALLOWED", f"Moved to {new_department}; stripped roles {old_roles} -> {new_roles} and prior temp grants.")
+            conn.commit()
+        res = self.get_identity(user_id)
+        assert res is not None
+        return res
 
-    def leaver(self, user_id: str, disabled_subjects: set[str], actor: str = "hr-lifecycle") -> dict[str, Any]:
-        ident = self.get_identity(user_id)
-        if not ident:
-            raise KeyError(f"Identity {user_id} not found.")
-        with self._connect() as conn:
+    def revoke_role(self, user_id: str, role_to_remove: str, actor: str = "access-review") -> dict[str, Any]:
+        """Atomically revoke a specific role from an active identity (enforced immediately across workers)."""
+        with self._tx_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT roles_json FROM identities WHERE user_id=?", (user_id,)).fetchone()
+            if not row:
+                conn.rollback()
+                raise KeyError(f"Identity {user_id} not found.")
+            roles = [r for r in json.loads(row["roles_json"]) if r != role_to_remove]
+            conn.execute("UPDATE identities SET roles_json=?, updated_at=? WHERE user_id=?", (json.dumps(roles), utc_iso(), user_id))
+            self._log_conn(conn, actor, "ROLE_REVOKED", user_id, "REVOKED", f"Removed {role_to_remove}; remaining={roles}")
+            conn.commit()
+        res = self.get_identity(user_id)
+        assert res is not None
+        return res
+
+    def leaver(self, user_id: str, disabled_subjects: set[str] | None = None, actor: str = "hr-lifecycle") -> dict[str, Any]:
+        """Atomically disable identity in persistent SQLite and revoke all roles/grants (survives restarts & workers)."""
+        with self._tx_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT user_id FROM identities WHERE user_id=?", (user_id,)).fetchone()
+            if not row:
+                conn.rollback()
+                raise KeyError(f"Identity {user_id} not found.")
             conn.execute(
                 "UPDATE identities SET status='DISABLED', roles_json='[]', direct_entitlements_json='[]', updated_at=? WHERE user_id=?",
                 (utc_iso(), user_id),
             )
             conn.execute("UPDATE temp_grants SET revoked=1 WHERE user_id=?", (user_id,))
-        disabled_subjects.add(user_id)
-        self._log(actor, "LEAVER", user_id, "REVOKED", "Account disabled, roles/grants stripped, subject added to PEP denylist.")
-        return self.get_identity(user_id)
+            self._log_conn(conn, actor, "LEAVER", user_id, "REVOKED", "Account disabled in persistent governance store; all roles & grants stripped.")
+            conn.commit()
+        if disabled_subjects is not None:
+            disabled_subjects.add(user_id)
+        res = self.get_identity(user_id)
+        assert res is not None
+        return res
 
     def grant_temporary_access(
         self,
@@ -195,53 +246,58 @@ class GovernanceEngine:
         approved_by: str,
         ttl_seconds: int,
     ) -> dict[str, Any]:
-        ident = self.get_identity(user_id)
-        if not ident or ident["status"] != "ACTIVE":
-            raise ValueError("Cannot grant temporary access to inactive or missing identity.")
-        conflicts = self.detect_sod_conflicts(ident["roles"], ident["direct_entitlements"], [entitlement])
-        if conflicts:
-            self._log(approved_by, "TEMP_GRANT_BLOCKED", user_id, "DENIED_SOD", str(conflicts))
-            raise ValueError(f"Temporary grant blocked by SoD: {[c['policy_id'] for c in conflicts]}")
-        gid = f"GRT-{uuid.uuid4().hex[:10].upper()}"
-        exp = utc_iso(utc_now() + timedelta(seconds=ttl_seconds))
-        with self._connect() as conn:
+        """Atomically evaluate cumulative SoD across permanent + ALL active temporary entitlements before granting (LIMEN-05)."""
+        with self._tx_lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status, roles_json, direct_entitlements_json FROM identities WHERE user_id=?", (user_id,)).fetchone()
+            if not row or row["status"] != "ACTIVE":
+                conn.rollback()
+                raise ValueError("Cannot grant temporary access to inactive or missing identity.")
+            roles = json.loads(row["roles_json"])
+            direct = json.loads(row["direct_entitlements_json"])
+            existing_temp = self._active_temp_in_conn(conn, user_id)
+            cumulative_temp = existing_temp + [entitlement]
+            conflicts = self.detect_sod_conflicts(roles, direct, cumulative_temp)
+            if conflicts:
+                self._log_conn(conn, approved_by, "TEMP_GRANT_BLOCKED", user_id, "DENIED_SOD", f"Cumulative SoD conflict: {[c['policy_id'] for c in conflicts]}")
+                conn.commit()
+                raise ValueError(f"Temporary grant blocked by cumulative SoD: {[c['policy_id'] for c in conflicts]}")
+            gid = f"GRT-{uuid.uuid4().hex[:10].upper()}"
+            exp = utc_iso(utc_now() + timedelta(seconds=ttl_seconds))
             conn.execute(
                 "INSERT INTO temp_grants (grant_id, user_id, entitlement, approved_by, expires_at, revoked) VALUES (?, ?, ?, ?, ?, 0)",
                 (gid, user_id, entitlement, approved_by, exp),
             )
-        self._log(approved_by, "TEMP_GRANT", user_id, "GRANTED", f"{entitlement} until {exp}")
+            self._log_conn(conn, approved_by, "TEMP_GRANT", user_id, "GRANTED", f"{entitlement} until {exp}")
+            conn.commit()
         return {"grant_id": gid, "user_id": user_id, "entitlement": entitlement, "expires_at": exp}
 
     def active_temp_entitlements(self, user_id: str, now: datetime | None = None) -> list[str]:
-        ref = now or utc_now()
         with self._connect() as conn:
-            rows = conn.execute("SELECT entitlement, expires_at FROM temp_grants WHERE user_id=? AND revoked=0", (user_id,)).fetchall()
-        active = []
-        for r in rows:
-            exp_dt = datetime.fromisoformat(r["expires_at"])
-            if exp_dt > ref:
-                active.append(r["entitlement"])
-        return active
+            return self._active_temp_in_conn(conn, user_id, now)
 
     def get_identity(self, user_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM identities WHERE user_id=?", (user_id,)).fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        d["roles"] = json.loads(d.pop("roles_json"))
-        d["direct_entitlements"] = json.loads(d.pop("direct_entitlements_json"))
-        d["active_temp_entitlements"] = self.active_temp_entitlements(user_id)
+            if not row:
+                return None
+            d = dict(row)
+            d["roles"] = json.loads(d.pop("roles_json"))
+            d["direct_entitlements"] = json.loads(d.pop("direct_entitlements_json"))
+            d["active_temp_entitlements"] = self._active_temp_in_conn(conn, user_id)
         d["effective_entitlements"] = sorted(
             self.effective_entitlements(d["roles"], d["direct_entitlements"], d["active_temp_entitlements"])
         )
         d["sod_conflicts"] = self.detect_sod_conflicts(d["roles"], d["direct_entitlements"], d["active_temp_entitlements"])
         return d
 
-    def list_identities(self) -> list[dict[str, Any]]:
+    def list_identities(self, tenant: str | None = None) -> list[dict[str, Any]]:
         with self._connect() as conn:
-            ids = [r["user_id"] for r in conn.execute("SELECT user_id FROM identities ORDER BY user_id").fetchall()]
-        return [self.get_identity(uid) for uid in ids if self.get_identity(uid)]
+            if tenant:
+                ids = [r["user_id"] for r in conn.execute("SELECT user_id FROM identities WHERE tenant=? ORDER BY user_id", (tenant,)).fetchall()]
+            else:
+                ids = [r["user_id"] for r in conn.execute("SELECT user_id FROM identities ORDER BY user_id").fetchall()]
+        return [ident for uid in ids if (ident := self.get_identity(uid)) is not None]
 
     def list_audit(self, limit: int = 30) -> list[dict[str, Any]]:
         with self._connect() as conn:

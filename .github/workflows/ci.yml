@@ -39,7 +39,7 @@ jobs:
 
   forge-reusable-security-gate:
     name: Cross-Project FORGE Reusable Security Gate
-    uses: Bassma202/ai-devsecops-telegram-agent/.github/workflows/reusable-security-gate.yml@main
+    uses: Bassma202/ai-devsecops-telegram-agent/.github/workflows/reusable-security-gate.yml@71cf90dd644f349f634deb2354c4ef642446cd17
     with:
       python-version: "3.12"
       source-path: "src"
